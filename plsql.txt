@@ -1,0 +1,82 @@
+CREATE OR REPLACE PACKAGE stock_ownership_pkg AS
+    PROCEDURE process_stock_ownership(exchange_filepath IN VARCHAR2, depository_filepath IN VARCHAR2);
+END stock_ownership_pkg;
+/
+
+CREATE OR REPLACE PACKAGE BODY stock_ownership_pkg AS
+
+    PROCEDURE load_data(filepath IN VARCHAR2, source IN VARCHAR2) IS
+        v_line VARCHAR2(4000);
+        v_user_id NUMBER;
+        v_stock_id NUMBER;
+        v_stock_count NUMBER;
+        v_file UTL_FILE.FILE_TYPE;
+        v_record_count NUMBER := 0;
+    BEGIN
+        v_file := UTL_FILE.FOPEN('YOUR_DIRECTORY', filepath, 'R');
+
+        LOOP
+            BEGIN
+                UTL_FILE.GET_LINE(v_file, v_line);
+                -- Parse the CSV line
+                v_user_id := TO_NUMBER(REGEXP_SUBSTR(v_line, '[^,]+', 1, 1));
+                v_stock_id := TO_NUMBER(REGEXP_SUBSTR(v_line, '[^,]+', 1, 2));
+                v_stock_count := TO_NUMBER(REGEXP_SUBSTR(v_line, '[^,]+', 1, 3));
+                
+                -- Insert data into StockOwnership
+                INSERT INTO StockOwnership (user_id, stock_id, stock_count, source)
+                VALUES (v_user_id, v_stock_id, v_stock_count, source);
+                v_record_count := v_record_count + 1;
+            EXCEPTION
+                WHEN NO_DATA_FOUND THEN
+                    EXIT;
+                WHEN VALUE_ERROR THEN
+                    DBMS_OUTPUT.PUT_LINE('Format error in line: ' || v_line);
+                    CONTINUE;
+            END;
+        END LOOP;
+
+        UTL_FILE.FCLOSE(v_file);
+        DBMS_OUTPUT.PUT_LINE('Loaded ' || v_record_count || ' records from ' || source);
+    EXCEPTION
+        WHEN OTHERS THEN
+            IF UTL_FILE.IS_OPEN(v_file) THEN
+                UTL_FILE.FCLOSE(v_file);
+            END IF;
+            RAISE_APPLICATION_ERROR(-20001, 'Error loading data from ' || filepath || ': ' || SQLERRM);
+    END load_data;
+
+    PROCEDURE process_stock_ownership(exchange_filepath IN VARCHAR2, depository_filepath IN VARCHAR2) IS
+        CURSOR c_ownership IS
+            SELECT user_id, stock_id,
+                   MAX(CASE WHEN source = 'EXCHANGE' THEN stock_count END) AS stock_count_exchange,
+                   MAX(CASE WHEN source = 'DEPOSITORY' THEN stock_count END) AS stock_count_depository
+            FROM StockOwnership
+            GROUP BY user_id, stock_id;
+
+        v_stock_count_exchange NUMBER;
+        v_stock_count_depository NUMBER;
+    BEGIN
+        -- Load data from both CSVs
+        load_data(exchange_filepath, 'EXCHANGE');
+        load_data(depository_filepath, 'DEPOSITORY');
+
+        -- Compare ownership records
+        FOR r IN c_ownership LOOP
+            v_stock_count_exchange := NVL(r.stock_count_exchange, 0);
+            v_stock_count_depository := NVL(r.stock_count_depository, 0);
+
+            INSERT INTO OwnershipLog (user_id, stock_id, stock_count_exchange, stock_count_depository, mismatch_flag)
+            VALUES (r.user_id, r.stock_id, v_stock_count_exchange, v_stock_count_depository,
+                    CASE WHEN v_stock_count_exchange <> v_stock_count_depository THEN 'YES' ELSE 'NO' END);
+        END LOOP;
+        
+        COMMIT;
+        DBMS_OUTPUT.PUT_LINE('Ownership comparison complete and logged.');
+    EXCEPTION
+        WHEN OTHERS THEN
+            RAISE_APPLICATION_ERROR(-20002, 'Error processing stock ownership: ' || SQLERRM);
+    END process_stock_ownership;
+
+END stock_ownership_pkg;
+/
